@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>friend-chat</title>
+<style>
+:root{
+  --bg:#12161d; --panel:#1a2029; --panel2:#222a36; --line:#2d3746;
+  --text:#e7eaf0; --sub:#8b96a8; --accent:#5aa2ff; --danger:#ff6b6b;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",Meiryo,sans-serif}
+button,input{font:inherit;color:inherit}
+button{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.on{background:var(--accent);border-color:var(--accent);color:#07111f}
+button.danger{background:var(--danger);border-color:var(--danger);color:#1a0707}
+input[type=text]{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;width:100%}
+#join{height:100%;display:grid;place-items:center;padding:16px}
+#join form{width:min(360px,100%);display:grid;gap:12px}
+#join h1{margin:0 0 4px;font-size:22px}
+#join label{display:grid;gap:4px;color:var(--sub);font-size:13px}
+#app{display:none;height:100%;grid-template-columns:minmax(0,1fr) 360px}
+#stage{display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
+#bar{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+#bar .room{margin-right:auto;font-weight:600}
+#grid{flex:1;display:grid;gap:8px;padding:8px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));grid-auto-rows:minmax(160px,1fr);overflow:auto}
+#grid:empty::before{content:"「通話に参加」を押すとカメラとマイクが有効になります。通話に参加していなくても、他の人の映像と画面共有は見られます。";color:var(--sub);padding:16px;grid-column:1/-1;align-self:start}
+.tile{position:relative;background:#000;border-radius:10px;overflow:hidden;cursor:pointer;min-height:160px}
+.tile video{width:100%;height:100%;object-fit:contain;display:block}
+.tile .label{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.6);padding:2px 8px;border-radius:6px;font-size:13px}
+.tile.focus{grid-column:1/-1;grid-row:span 2}
+.tile.self video{transform:scaleX(-1)}
+.tile.self.screen video{transform:none}
+#chat{display:flex;flex-direction:column;min-height:0;background:var(--panel)}
+#log{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:100%}
+.msg .who{font-size:12px;color:var(--sub)}
+.msg .body{white-space:pre-wrap;word-break:break-word}
+.msg.me .who{color:var(--accent)}
+.msg img{max-width:100%;max-height:260px;border-radius:8px;display:block;margin-top:4px;cursor:zoom-in}
+.msg a.file{display:inline-block;margin-top:4px;padding:6px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--text);text-decoration:none}
+.sys{color:var(--sub);font-size:12px;text-align:center}
+#form{display:flex;gap:6px;padding:10px;border-top:1px solid var(--line)}
+#form input[type=text]{flex:1}
+#drop{display:none;position:fixed;inset:0;background:rgba(90,162,255,.2);border:3px dashed var(--accent);z-index:9;place-items:center;font-size:20px}
+@media(max-width:800px){
+  #app{grid-template-columns:1fr;grid-template-rows:55% 45%}
+  #stage{border-right:0;border-bottom:1px solid var(--line)}
+}
+</style>
+</head>
+<body>
+<div id="join">
+  <form id="joinForm">
+    <h1>friend-chat</h1>
+    <label>名前<input type="text" id="name" maxlength="30" required autocomplete="off"></label>
+    <label>ルーム名(同じ名前の人同士が繋がります)<input type="text" id="room" maxlength="50" required autocomplete="off"></label>
+    <button class="on" type="submit">入室</button>
+  </form>
+</div>
+<div id="app">
+  <section id="stage">
+    <div id="bar">
+      <span class="room" id="roomLabel"></span>
+      <button id="btnCall">通話に参加</button>
+      <button id="btnMic" disabled>マイク</button>
+      <button id="btnCam" disabled>カメラ</button>
+      <button id="btnScreen">画面共有</button>
+    </div>
+    <div id="grid"></div>
+  </section>
+  <section id="chat">
+    <div id="log"></div>
+    <form id="form">
+      <button type="button" id="btnFile" title="ファイルを添付">添付</button>
+      <input type="file" id="file" hidden>
+      <input type="text" id="text" placeholder="メッセージ" autocomplete="off">
+      <button class="on" type="submit">送信</button>
+    </form>
+  </section>
+</div>
+<div id="drop">ここにドロップして送信</div>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const MAX_FILE = 8 * 1024 * 1024;
+let socket, myId, myName, iceServers = [];
+const peers = new Map();
+const screenStreamIds = new Set();
+let camStream = null, screenStream = null;
+let camSenders = new Map(), screenSenders = new Map();
+
+$('name').value = localStorage.getItem('fc_name') || '';
+$('room').value = localStorage.getItem('fc_room') || '';
+$('joinForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  myName = $('name').value.trim();
+  const room = $('room').value.trim();
+  localStorage.setItem('fc_name', myName);
+  localStorage.setItem('fc_room', room);
+  try { iceServers = (await (await fetch('/config')).json()).iceServers; } catch {}
+  $('join').style.display = 'none';
+  $('app').style.display = 'grid';
+  $('roomLabel').textContent = room;
+  start(room);
+});
+
+function start(room) {
+  socket = io();
+  socket.on('connect', () => socket.emit('join', { room, name: myName }));
+  socket.on('joined', ({ id, peers: list }) => {
+    myId = id;
+    list.forEach((p) => createPeer(p.id, p.name));
+  });
+  socket.on('peer-joined', ({ id, name }) => {
+    createPeer(id, name);
+    attachLocalTracks(id);
+  });
+  socket.on('peer-left', ({ id }) => removePeer(id));
+  socket.on('system', (t) => addSys(t));
+  socket.on('chat', addChat);
+  socket.on('signal', onSignal);
+  socket.on('screen-meta', ({ streamId }) => {
+    screenStreamIds.add(streamId);
+    const t = document.querySelector(`[data-stream="${streamId}"] .label`);
+    if (t) t.textContent = t.textContent.replace(/(の画面)?$/, 'の画面');
+  });
+}
+
+function createPeer(id, name) {
+  if (peers.has(id)) return peers.get(id);
+  const pc = new RTCPeerConnection({ iceServers });
+  const p = { pc, name, polite: myId ? myId < id : true, makingOffer: false, ignoreOffer: false };
+  p.polite = myId < id;
+  peers.set(id, p);
+  pc.onicecandidate = (e) => { if (e.candidate) socket.emit('signal', { to: id, data: { candidate: e.candidate } }); };
+  pc.onnegotiationneeded = async () => {
+    try {
+      p.makingOffer = true;
+      await pc.setLocalDescription();
+      socket.emit('signal', { to: id, data: { description: pc.localDescription } });
+    } catch (err) { console.error(err); }
+    finally { p.makingOffer = false; }
+  };
+  pc.ontrack = ({ track, streams }) => {
+    const stream = streams[0];
+    if (!stream) return;
+    showStream(id, p.name, stream);
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed') pc.restartIce();
+  };
+  return p;
+}
+
+async function onSignal({ from, data }) {
+  const p = peers.get(from) || createPeer(from, '参加者');
+  const pc = p.pc;
+  try {
+    if (data.description) {
+      const offerCollision = data.description.type === 'offer' && (p.makingOffer || pc.signalingState !== 'stable');
+      p.ignoreOffer = !p.polite && offerCollision;
+      if (p.ignoreOffer) return;
+      await pc.setRemoteDescription(data.description);
+      if (data.description.type === 'offer') {
+        await pc.setLocalDescription();
+        socket.emit('signal', { to: from, data: { description: pc.localDescription } });
+      }
+    } else if (data.candidate) {
+      try { await pc.addIceCandidate(data.candidate); }
+      catch (err) { if (!p.ignoreOffer) throw err; }
+    }
+  } catch (err) { console.error(err); }
+}
+
+function removePeer(id) {
+  const p = peers.get(id);
+  if (!p) return;
+  p.pc.close();
+  peers.delete(id);
+  document.querySelectorAll(`[data-peer="${id}"]`).forEach((el) => el.remove());
+  camSenders.delete(id); screenSenders.delete(id);
+}
+
+function showStream(peerId, name, stream) {
+  let tile = document.querySelector(`[data-stream="${stream.id}"]`);
+  if (!tile) {
+    tile = makeTile(stream, name, false);
+    tile.dataset.peer = peerId;
+    stream.onremovetrack = () => {
+      if (!stream.getTracks().length) tile.remove();
+    };
+  }
+  const isScreen = screenStreamIds.has(stream.id);
+  tile.querySelector('.label').textContent = name + (isScreen ? 'の画面' : '');
+  if (isScreen) tile.classList.add('screen');
+}
+
+function makeTile(stream, label, self) {
+  const tile = document.createElement('div');
+  tile.className = 'tile' + (self ? ' self' : '');
+  tile.dataset.stream = stream.id;
+  const v = document.createElement('video');
+  v.autoplay = true; v.playsInline = true;
+  if (self) v.muted = true;
+  v.srcObject = stream;
+  const l = document.createElement('div');
+  l.className = 'label';
+  l.textContent = label;
+  tile.append(v, l);
+  tile.addEventListener('click', () => tile.classList.toggle('focus'));
+  $('grid').appendChild(tile);
+  return tile;
+}
+
+function addTracks(peerId, stream, store) {
+  const p = peers.get(peerId);
+  if (!p || !stream) return;
+  const senders = stream.getTracks().map((t) => p.pc.addTrack(t, stream));
+  store.set(peerId, senders);
+}
+function dropTracks(store) {
+  for (const [id, senders] of store) {
+    const p = peers.get(id);
+    if (p) senders.forEach((s) => { try { p.pc.removeTrack(s); } catch {} });
+  }
+  store.clear();
+}
+function attachLocalTracks(peerId) {
+  if (camStream) addTracks(peerId, camStream, camSenders);
+  if (screenStream) {
+    addTracks(peerId, screenStream, screenSenders);
+    socket.emit('screen-meta', { streamId: screenStream.id });
+  }
+}
+
+$('btnCall').addEventListener('click', async () => {
+  if (camStream) return leaveCall();
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch (err) {
+    try { camStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { return alert('カメラ/マイクを使えませんでした: ' + err.message); }
+  }
+  makeTile(camStream, myName + '(自分)', true);
+  for (const id of peers.keys()) addTracks(id, camStream, camSenders);
+  $('btnCall').textContent = '通話を退出';
+  $('btnCall').classList.add('danger');
+  ['btnMic', 'btnCam'].forEach((b) => { $(b).disabled = false; $(b).classList.add('on'); });
+});
+
+function leaveCall() {
+  dropTracks(camSenders);
+  camStream.getTracks().forEach((t) => t.stop());
+  document.querySelector(`[data-stream="${camStream.id}"]`)?.remove();
+  camStream = null;
+  $('btnCall').textContent = '通話に参加';
+  $('btnCall').classList.remove('danger');
+  ['btnMic', 'btnCam'].forEach((b) => { $(b).disabled = true; $(b).classList.remove('on'); });
+}
+
+function toggleTrack(kind, btn) {
+  if (!camStream) return;
+  const tracks = kind === 'audio' ? camStream.getAudioTracks() : camStream.getVideoTracks();
+  if (!tracks.length) return;
+  const on = !tracks[0].enabled;
+  tracks.forEach((t) => (t.enabled = on));
+  btn.classList.toggle('on', on);
+  btn.textContent = (kind === 'audio' ? 'マイク' : 'カメラ') + (on ? '' : ' OFF');
+}
+$('btnMic').addEventListener('click', (e) => toggleTrack('audio', e.currentTarget));
+$('btnCam').addEventListener('click', (e) => toggleTrack('video', e.currentTarget));
+
+$('btnScreen').addEventListener('click', async () => {
+  if (screenStream) return stopScreen();
+  if (!navigator.mediaDevices.getDisplayMedia) return alert('このブラウザは画面共有に対応していません(スマホでは使えないことが多いです)');
+  try {
+    screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  } catch { return; }
+  socket.emit('screen-meta', { streamId: screenStream.id });
+  makeTile(screenStream, '自分の画面', true).classList.add('screen');
+  for (const id of peers.keys()) addTracks(id, screenStream, screenSenders);
+  $('btnScreen').textContent = '共有を停止';
+  $('btnScreen').classList.add('danger');
+  screenStream.getVideoTracks()[0].addEventListener('ended', stopScreen);
+});
+function stopScreen() {
+  if (!screenStream) return;
+  dropTracks(screenSenders);
+  screenStream.getTracks().forEach((t) => t.stop());
+  document.querySelector(`[data-stream="${screenStream.id}"]`)?.remove();
+  screenStream = null;
+  $('btnScreen').textContent = '画面共有';
+  $('btnScreen').classList.remove('danger');
+}
+
+function addSys(t) {
+  const d = document.createElement('div');
+  d.className = 'sys'; d.textContent = t;
+  pushLog(d);
+}
+function pushLog(el) {
+  const log = $('log');
+  const near = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  log.appendChild(el);
+  if (near) log.scrollTop = log.scrollHeight;
+}
+function addChat(m) {
+  const d = document.createElement('div');
+  d.className = 'msg' + (m.id === myId ? ' me' : '');
+  const who = document.createElement('div');
+  who.className = 'who';
+  who.textContent = m.from + '  ' + new Date(m.ts).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+  d.appendChild(who);
+  if (m.text) {
+    const b = document.createElement('div');
+    b.className = 'body'; b.textContent = m.text;
+    d.appendChild(b);
+  }
+  if (m.file) {
+    if (/^image\/(png|jpe?g|gif|webp|bmp)$/.test(m.file.type)) {
+      const img = document.createElement('img');
+      img.src = m.file.data; img.alt = m.file.name;
+      img.addEventListener('click', () => { const w = window.open(); w.document.write(`<img src="${m.file.data}" style="max-width:100%">`); });
+      d.appendChild(img);
+    }
+    const a = document.createElement('a');
+    a.className = 'file'; a.href = m.file.data; a.download = m.file.name;
+    a.textContent = '📎 ' + m.file.name;
+    d.appendChild(a);
+  }
+  pushLog(d);
+}
+
+$('form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = $('text').value.trim();
+  if (!text) return;
+  socket.emit('chat', { text });
+  $('text').value = '';
+});
+
+function sendFile(file) {
+  if (!file) return;
+  if (file.size > MAX_FILE) return alert('ファイルが大きすぎます(上限 8MB)');
+  const r = new FileReader();
+  r.onload = () => socket.emit('chat', { file: { name: file.name, type: file.type, data: r.result } });
+  r.readAsDataURL(file);
+}
+$('btnFile').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', (e) => { sendFile(e.target.files[0]); e.target.value = ''; });
+$('text').addEventListener('paste', (e) => {
+  const f = [...(e.clipboardData?.files || [])][0];
+  if (f) { e.preventDefault(); sendFile(f); }
+});
+let dragN = 0;
+addEventListener('dragenter', (e) => { e.preventDefault(); dragN++; $('drop').style.display = 'grid'; });
+addEventListener('dragleave', () => { if (--dragN <= 0) { dragN = 0; $('drop').style.display = 'none'; } });
+addEventListener('dragover', (e) => e.preventDefault());
+addEventListener('drop', (e) => {
+  e.preventDefault(); dragN = 0; $('drop').style.display = 'none';
+  sendFile(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>
